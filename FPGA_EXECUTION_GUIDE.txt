@@ -1,0 +1,248 @@
+================================================================================
+ FPGA EXECUTION GUIDE — SoCurity Anomaly Detection on ESP VC707
+================================================================================
+
+ SYSTEM OVERVIEW
+================================================================================
+
+Your anomaly detection system has these components:
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │  ESP VC707 FPGA (2×2 SoC)                                   │
+  │                                                              │
+  │  ┌─────────────┐  ┌─────────────┐                          │
+  │  │ Tile 0      │  │ Tile 1      │                          │
+  │  │ x-heep ACC  │  │ x-heep ACC  │                          │
+  │  │ (Ibex RV32) │  │             │                          │
+  │  │ OCSVM det.  │  │             │                          │
+  │  └─────────────┘  └─────────────┘                          │
+  │  ┌─────────────┐  ┌─────────────┐                          │
+  │  │ Tile 2      │  │ Tile 3      │                          │
+  │  │ Memory tile │  │ CPU tile    │                          │
+  │  │ DDR3 + LLC  │  │ Ariane RV64 │ ← Linux runs here       │
+  │  └─────────────┘  └─────────────┘                          │
+  └──────────────────────────────────────────────────────────────┘
+
+  Linux userspace programs (on Ariane):
+    background_monitor.exe  — OCSVM inference + SoCurity alert polling
+    collect_esp_monitors.exe — CSV training data collector (392 columns)
+    xheep_loader.exe        — DMA-loads OCSVM firmware onto Ibex
+    Mini-era executables    — Legitimate workload / DoS stress generator
+
+  Bare-metal firmware (on Ibex):
+    ocsvm_baremetal.bin     — OCSVM anomaly detector (6 features, 33 SVs)
+
+
+ STEP-BY-STEP FPGA EXECUTION
+================================================================================
+
+ PHASE A: Build the FPGA Bitstream (one-time, ~4-8 hours)
+────────────────────────────────────────────────────────────
+
+  cd ~/anomalydetection/esp-heep/socs/xilinx-vc707-xc7vx485t
+
+  # 1. Configure the SoC (GUI — select CPU, accelerators, memory)
+  make esp-xconfig
+
+  # 2. Generate SoC RTL
+  make socgen
+
+  # 3. Build Linux kernel + rootfs
+  make linux
+
+  # 4. Synthesize FPGA bitstream (Vivado — takes several hours)
+  make vivado-syn
+
+  NOTE: The x-heep tile, monitors, and SoCurity IRQ hardware must be in
+  the SoC configuration. Verify that the XHEEP accelerator appears in the
+  esp-xconfig GUI before synthesizing.
+
+
+ PHASE B: Program FPGA and Boot Linux
+────────────────────────────────────────
+
+  # 5. Program the FPGA
+  make fpga-program
+
+  # 6. Boot Linux (connects via UART)
+  make fpga-run-linux
+
+  You should see Linux booting on the serial console. Once you get a
+  root shell prompt, proceed to Phase C.
+
+
+ PHASE C: Build and Deploy Software
+────────────────────────────────────
+
+  From the build host (not the FPGA):
+
+  # 7. Build all components (already done if you followed prior steps)
+  cd ~/anomalydetection
+  (cd background_monitor && make)
+  (cd data_collector && make)
+  (cd xheep_loader && make)
+  (cd ocsvm_baremetal && make)
+
+  # 8. Build Mini-era for ESP RISC-V
+  cd ~/anomalydetection/mini-era-integration
+  ./build_mini_era.sh
+
+  # 9. Package everything for deployment
+  ./deploy_to_fpga.sh
+
+  # 10. Copy to FPGA
+  scp ~/anomalydetection/anomaly_detection_pkg.tar.gz root@<fpga-ip>:/root/
+
+  # 11. On the FPGA (via SSH or serial console):
+  cd /root
+  tar xzf anomaly_detection_pkg.tar.gz
+  cd anomaly_detection_pkg
+
+
+ PHASE D: Run the Anomaly Detection System
+────────────────────────────────────────────
+
+  All commands below run ON THE FPGA (Linux on Ariane):
+
+  # 12. Load OCSVM firmware onto Ibex
+  ./xheep_loader.exe ./ocsvm_baremetal.bin
+
+  Expected output:
+    [xheep_loader] firmware: ocsvm_baremetal.bin (60928 bytes, 15232 words)
+    [xheep_loader] DMA fetch complete
+    [xheep_loader] Ibex released — OCSVM anomaly detector running
+
+
+ PHASE E: Collect Normal Baseline Data
+────────────────────────────────────────
+
+  # 13. Collect 60 seconds of normal operation data
+  ./run_normal_baseline.sh 60
+
+  This runs Mini-era at normal intensity while recording:
+    /root/data/normal_<timestamp>.csv  — 392-column CSV for model training
+    /root/data/monitor_normal_<timestamp>.log — OCSVM detection log
+
+  EXPECTED RESULT: Mostly "regular" labels from background_monitor.
+  The OCSVM should show low anomaly rate (<5%) during normal operation.
+
+
+ PHASE F: Simulate DoS Attack
+────────────────────────────────
+
+  # 14. Run DoS attack simulation (60 seconds)
+  ./run_dos_attack.sh 60
+
+  This runs Mini-era with extreme stress parameters:
+    -A       : obstacles in all 5 highway lanes
+    -p 10    : 10× plan-and-control compute repeat
+    -v 3     : maximum-length Viterbi messages (1500 chars)
+    -n 2     : one message per obstacle + one global per timestep
+    -W dos_world.desc : 70% obstacle appearance probability
+
+  Output files:
+    /root/data/dos_<timestamp>.csv   — CSV with label=dos
+    /root/data/monitor_dos_<timestamp>.log — OCSVM detection log
+
+  WHAT TO OBSERVE:
+    • Console shows [!] ANOMALY lines when OCSVM detects abnormal counters
+    • The DoS-stress Mini-era creates heavy NoC traffic, DDR pressure,
+      and CPU contention that differs from the normal baseline pattern
+    • background_monitor.exe reports anomaly detection rate
+    • If SoCurity IRQ is wired: [irq] SoCurity alert messages appear
+
+  EXPECTED RESULT: Higher anomaly rate (>20-50%) during DoS attack
+  compared to the normal baseline.
+
+
+ PHASE G: Analyze Results
+────────────────────────────
+
+  # 15. Copy data files back to build host
+  scp root@<fpga-ip>:/root/data/*.csv ~/anomalydetection/results/
+  scp root@<fpga-ip>:/root/data/*.log ~/anomalydetection/results/
+
+  # 16. Quick comparison (on build host):
+  python3 << 'EOF'
+  import pandas as pd
+  import glob
+
+  normal = pd.concat([pd.read_csv(f) for f in glob.glob('results/normal_*.csv')])
+  dos = pd.concat([pd.read_csv(f) for f in glob.glob('results/dos_*.csv')])
+
+  print("=== Normal baseline ===")
+  print(normal.describe().loc[['mean','std']].T.head(20))
+  print(f"\nNormal samples: {len(normal)}")
+
+  print("\n=== DoS attack ===")
+  print(dos.describe().loc[['mean','std']].T.head(20))
+  print(f"\nDoS samples: {len(dos)}")
+
+  # Key features to compare
+  key_cols = [
+      'Off-chip memory accesses at mem tile 0',
+      'Coherence requests to LLC 0',
+      'DMA requests to mem tile 0',
+      'NoC packets injected at tile 0 on plane 0'
+  ]
+  for col in key_cols:
+      if col in normal.columns:
+          print(f"\n{col}:")
+          print(f"  Normal: mean={normal[col].mean():.1f} std={normal[col].std():.1f}")
+          print(f"  DoS:    mean={dos[col].mean():.1f} std={dos[col].std():.1f}")
+  EOF
+
+
+ TROUBLESHOOTING
+================================================================================
+
+  Q: xheep_loader says "PT_NCHUNK_MAX = 0"
+  A: The XHEEP tile may not support scatter-gather DMA, or the APB base
+     address is wrong. Verify XHEEP_APB_BASE matches your hardware design.
+     Check: devmem 0x60010018 (should return > 0)
+
+  Q: background_monitor says "SoCurity IRQ MMIO not mapped"
+  A: Normal if running without root. Use: sudo ./background_monitor.exe -o log
+     Or set SOCURITY_ALERT_BASE env var if address changed.
+
+  Q: All samples show ANOMALY even during "normal" operation
+  A: The OCSVM model was trained on a 3×3 SoC; 2×2 counter patterns are
+     inherently different. Consider retraining:
+     1. Collect 600+ normal samples: ./run_normal_baseline.sh 600
+     2. Retrain: python3 export_model.py --input normal_data.csv
+
+  Q: Mini-era fails with "cannot open trace file"
+  A: Ensure traces/ directory was deployed. Check: ls traces/tt02.new
+
+  Q: collect_esp_monitors says "esp_monitor: mmap failed"
+  A: Need root access for /dev/mem. Use: sudo ./collect_esp_monitors.exe ...
+
+  Q: DMA fetch timeout in xheep_loader
+  A: The Ibex core may be in an unexpected state. Try power-cycling the FPGA
+     and re-running from Phase B (make fpga-program).
+
+
+ FILE MANIFEST
+================================================================================
+
+  Built binaries (RISC-V 64-bit Linux):
+    background_monitor/background_monitor.exe  — OCSVM monitor + IRQ handler
+    data_collector/collect_esp_monitors.exe     — CSV data collector
+    xheep_loader/xheep_loader.exe              — Ibex firmware loader
+
+  Built binaries (RISC-V 32-bit bare-metal):
+    ocsvm_baremetal/ocsvm_baremetal.bin         — OCSVM firmware for Ibex
+
+  Scripts:
+    mini-era-integration/build_mini_era.sh     — Build Mini-era for ESP
+    mini-era-integration/run_normal_baseline.sh — Normal data collection
+    mini-era-integration/run_dos_attack.sh     — DoS attack simulation
+    mini-era-integration/deploy_to_fpga.sh     — Package for deployment
+    mini-era-integration/dos_world.desc        — High-stress world config
+
+  Key source files:
+    background_monitor/background_monitor.c    — Linux OCSVM monitor
+    data_collector/collect_esp_monitors.c       — CSV collector (392 cols)
+    xheep_loader/xheep_loader.c               — Linux firmware loader
+    ocsvm_baremetal/ocsvm_baremetal.c          — Ibex OCSVM detector
+    esp-heep/socs/.../systest.c               — Bare-metal launch (sim only)

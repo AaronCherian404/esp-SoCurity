@@ -1,0 +1,429 @@
+================================================================================
+  SoCurity on ESP-HEEP: Change Log and Design Notes
+  Generated: 2026-04-14
+================================================================================
+
+This document records every file modified or created during the SoCurity
+anomaly-detection integration effort on the ESP+x-heep VC707 platform.  It
+covers the why, what, and how of each change and notes the sources used.
+
+================================================================================
+CONTEXT AND GOALS
+================================================================================
+
+The objective is a closed-loop, hardware-accelerated anomaly detection system:
+
+  Ariane (RV64 Linux) ──── monitors ESP NoC/DDR/DMA counters
+  Ibex   (RV32, x-heep) ─── runs OCSVM inference on those counters
+                        └─── raises a hardware alert (PLIC IRQ) to Ariane
+                             when an anomaly is detected
+
+The project uses the ESP (Embedded Scalable Platform) SoC framework from
+Columbia University, with an x-heep (RISC-V PULP core) third-party tile as the
+OCSVM accelerator.  Target board: Xilinx VC707 (xc7vx485t).
+
+The work was split into phases:
+  Phase 0 – preflight snapshot
+  Phase 1 – MMIO hook: discover SoCurity register base address in x-heep
+  Phase 2 – PLIC/IRQ infrastructure in bare-metal Ariane launcher
+  Phase 3 – DMA-load OCSVM firmware into Ibex SRAM from Ariane
+  Phase 4 – Linux data collector for OCSVM training data (CSV output)
+
+================================================================================
+FILE 1: ocsvm_baremetal/link.ld
+================================================================================
+
+WHAT IT IS
+  GNU linker script for the Ibex RV32 bare-metal OCSVM firmware.
+
+WHY IT WAS CHANGED
+  The original linker script used a flat 64 KB memory map that did not match
+  the actual x-heep memory configuration on the VC707.  When ocsvm_baremetal.c
+  was compiled against it, the resulting ELF placed .rodata (the OCSVM model
+  weight arrays) at an address that would overlap with the instruction SRAM,
+  causing undefined behaviour at runtime on Ibex.
+
+WHAT CHANGED
+  -- BEFORE --
+  IRAM as ORIGIN = 0x00000000  LENGTH = 0x10000   (64 KB)
+  DRAM as ORIGIN = 0x00010000  LENGTH = 0x10000   (64 KB, but misaligned)
+
+  -- AFTER --
+  IRAM  ORIGIN = 0x00000000  LENGTH = 0xE800   (59392 B code/text region)
+  DRAM  ORIGIN = 0x0000E800  LENGTH = 0x11800  (71680 B data region)
+
+SOURCE OF TRUTH
+  esp-heep/accelerators/third-party/xheep/ip/x-heep/configs/esp_heep.hjson
+  That file defines the x-heep memory banks as two contiguous 64 KB banks with
+  the code linker section at address 0 and the data linker section starting at
+  0xE800.  The Makefile inside the x-heep repo also exports these symbols; we
+  read them directly to derive the boundaries.
+
+DESIGN CHOICE
+  Rather than using the generic x-heep default (which targets a standalone
+  system), we align to the ESP integration configuration where the two banks
+  are merged in address space but separated at the 0xE800 boundary as required
+  by the x-heep linker script convention.
+
+================================================================================
+FILE 2: ocsvm_baremetal/Makefile
+================================================================================
+
+WHAT IT IS
+  Build system for the Ibex RV32 OCSVM firmware.
+
+WHY IT WAS CHANGED
+  Linking ocsvm_baremetal.c failed with undefined symbol errors for soft-float
+  helper routines (__mulsf3, __addsf3, __divsf3, etc.).  These come from GCC's
+  libgcc because Ibex has no hardware FPU and the firmware uses float
+  arithmetic for OCSVM kernel computation.
+
+WHAT CHANGED
+  Added to LDFLAGS:
+      LDFLAGS += -lgcc
+
+SOURCE OF TRUTH
+  GCC cross-compiler documentation: soft-float helpers are in libgcc, which
+  must be linked explicitly when not using the C++ standard library.  The
+  cross-compiler used is:
+      /home/amc2535/tools/riscv/bin/riscv32-unknown-elf-gcc  (v12.2.0)
+  confirmed via `riscv32-unknown-elf-gcc --version`.
+
+DESIGN CHOICE
+  -lgcc is the minimal fix.  Alternatives (newlib -lm, full libstdc++) would
+  pull in unnecessary code and increase binary size, which matters because the
+  firmware must fit in Ibex IRAM (< 59 KB).
+
+BUILD RESULT
+  ocsvm_baremetal/ocsvm_baremetal.bin: 6284-byte ELF
+  Flat image (padded to rodata offset at 0xE800): 60928 bytes
+
+================================================================================
+FILE 3: esp-heep/socs/xilinx-vc707-xc7vx485t/ocsvm_fw_image.h   (NEW FILE)
+================================================================================
+
+WHAT IT IS
+  A generated C header containing the entire ocsvm_baremetal.bin binary as a
+  byte array, so it can be compiled into the Ariane bare-metal launcher
+  (systest.c) without a separate file-transfer step.
+
+HOW IT WAS GENERATED
+  From the ocsvm_baremetal/ directory:
+      xxd -i ocsvm_baremetal.bin \
+          | sed 's/unsigned char ocsvm_baremetal_bin/static const uint8_t ocsvm_fw_image/' \
+          | sed 's/unsigned int ocsvm_baremetal_bin_len/static const uint32_t ocsvm_fw_image_len/' \
+          > ocsvm_fw_image.h
+      cp ocsvm_fw_image.h ../esp-heep/socs/xilinx-vc707-xc7vx485t/
+
+WHY THIS APPROACH
+  ESP's bare-metal Ariane launcher (systest.c) runs entirely without a
+  filesystem or OS.  The only way to supply the firmware image to Ariane is to
+  embed it in the launcher binary itself.  xxd -i is the idiomatic way to do
+  this in C; the result is a static const uint8_t array placed in .rodata and
+  accessible via a simple pointer.
+
+  An alternative would be to hard-code the image in DRAM at a fixed physical
+  address via the simulator/debugger, but that would require a separate script
+  step per build and is fragile.
+
+CONTENTS
+  static const uint8_t   ocsvm_fw_image[60928]  — the flat binary image
+  static const uint32_t  ocsvm_fw_image_len      — 60928 (0xEE00)
+
+================================================================================
+FILE 4: esp-heep/socs/xilinx-vc707-xc7vx485t/systest.c
+================================================================================
+
+WHAT IT IS
+  The bare-metal Ariane (RV64) launcher program for the ESP VC707 SoC.  This
+  is the first C program executed by the Ariane CPU after boot.  It configures
+  the SoC, loads firmware into x-heep, and handles alerts.
+
+ORIGINAL STATE (before this session)
+  The file contained basic register access helpers (mmio_rd32/wr32) and a
+  placeholder spin loop.  A prior x-heep ROM-boot path (`xheep_launch()`) was
+  a stub.
+
+CHANGES MADE (three phases)
+
+  ── Phase 1: MMIO hook and register base discovery ──────────────────────────
+
+  Added at top of file:
+    - Documented the SoCurity APB register map as discovered from the x-heep
+      peripheral configuration:
+        0x60010000  TRIGGER    (RW) — set to 1 to signal alert to x-heep
+        0x60010004  ITERATION  (RO) — OCSVM inference iteration counter
+        0x60010008  CLEAR      (WO) — write 1 to clear the alert flag
+        0x6001000C  STATUS     (RO) — bit0 = alert active
+
+  SOURCE: The base address 0x60010000 was confirmed by running `make sim`
+  and inspecting the ESP-generated soc_map header and the APB address
+  decoding in the x-heep wrapper.
+
+  ── Phase 2: PLIC setup and IRQ handler ─────────────────────────────────────
+
+  Added:
+    - PLIC base address constant: 0x6C000000 (from ESP soc_defs / RISC-V
+      SiFive PLIC spec for the VC707 Ariane configuration).
+    - PLIC source number for x-heep interrupt: source 6 (PLIC_SRC_XHEEP = 6U).
+    - Four helper functions:
+        plic_set_priority(src, prio)
+        plic_enable_src(src)
+        plic_set_threshold(thr)
+        plic_claim() / plic_complete(src)
+      These follow the standard SiFive PLIC register layout:
+        priority   at PLIC_BASE + 4*src
+        enable     at PLIC_BASE + 0x2000 (context 0 hart 0 M-mode)
+        threshold  at PLIC_BASE + 0x200000
+        claim/comp at PLIC_BASE + 0x200004
+    - handle_trap() override: the ESP bare-metal runtime in
+      soft/ariane/common/syscalls.c defines a weak handle_trap() stub.  We
+      override it to intercept PLIC-delivered machine external interrupts
+      (cause = MCAUSE_MEXT = 0x8000000000000009).  On receipt:
+        1. Claim the interrupt from the PLIC.
+        2. If claimed source == PLIC_SRC_XHEEP read the ITERATION register.
+        3. Complete (acknowledge) the interrupt to the PLIC.
+        4. Set g_alert_received = 1 and g_alert_iteration.
+    - Global volatile flags: g_alert_received, g_alert_iteration.
+    - mstatus.MIE is enabled via set_csr(mstatus, MSTATUS_MIE) before the
+      spin loop.
+
+  SOURCE:
+    - PLIC register layout: SiFive PLIC documentation and the RISC-V
+      privileged spec (v1.11).
+    - Interrupt bit positions (MIP_MEIP, MSTATUS_MIE): encoding.h from
+      esp-heep/soft/ariane/ (already included by the ESP bare metal runtime).
+    - PLIC base address confirmed from the ESP SoC map:
+      grep PLIC esp-heep/socs/xilinx-vc707-xc7vx485t/socgen/esp/*.h
+
+  SIMULATION OUTPUT (confirmed before further changes):
+    [systest] PLIC src=6 enabled, waiting for SoCurity IRQ...
+    [systest] SoCurity IRQ pending (RTL integration required)
+
+  ── Phase 3: DMA-load OCSVM firmware into Ibex SRAM ────────────────────────
+
+  Added:
+    - #include "ocsvm_fw_image.h"  (top of file)
+    - Forward declarations for mmio_rd32 / mmio_wr32 (required because
+      xheep_launch() calls them before their inline definition below main).
+    - XHEEP APB register offsets (from x-heep esp_heep.hjson and the ESP
+      XHEEP wrapper register map):
+        XHEEP_BASE           0x60000000  — base of x-heep APB config window
+        XHEEP_CMD_REG        0x00        — command register (1 = START)
+        XHEEP_STATUS_REG     0x04        — status register (bit2 = DONE)
+        XHEEP_PT_ADDRESS_REG 0x0C        — physical address of page table
+        XHEEP_COHERENCE_REG  0x20        — 0 = non-coherent DMA
+        XHEEP_CODE_SIZE_REG  0x40        — firmware size in 32-bit words
+        XHEEP_FETCH_ADDR_REG 0x44        — DRAM start address for DMA
+        XHEEP_FETCH_TRIG_REG 0x48        — 1 = perform DMA-fetch
+        XHEEP_EXIT_TRIG_REG  0x4C        — 1 = release Ibex exit-loop
+    - xheep_fw_ptable[1]: a one-entry DMA page table.  The ESP DMA subsystem
+      uses a scatter-gather TLB; we supply a single entry mapping the entire
+      firmware image as one contiguous 1 MB chunk.
+    - xheep_launch(): two-step firmware load function:
+        Step 1 (DMA fetch):
+          - Set PT_ADDRESS = physical address of xheep_fw_ptable[].
+          - Set CODE_SIZE_WORDS = ocsvm_fw_image_len / 4.
+          - Set FETCH_TRIG = 1, EXIT_TRIG = 0, CMD_START = 1.
+          - Poll STATUS_REG bit2 (DONE) with a timeout of ~1 million polls.
+        Step 2 (release Ibex):
+          - Clear CODE_SIZE, FETCH_TRIG.
+          - Set EXIT_TRIG = 1, CMD_START = 1.
+          - Ibex exits its boot exit-loop and begins executing from address 0
+            in the freshly-loaded SRAM.
+
+  SOURCE:
+    - ESP XHEEP wrapper register map: read from
+      esp-heep/accelerators/third-party/xheep/xheep_wrapper.v (APB slave
+      decode block — case statements on paddr[7:0]).
+    - DMA page-table format: ESP DMA driver (soft/common/drivers) and the
+      ESP architecture documentation.  Single-entry PT is sufficient because
+      the firmware is < 64 KB and therefore fits in a single DMA chunk.
+    - FETCH_TRIG / EXIT_TRIG semantics confirmed from the xheep_wrapper.v
+      state machine and comments.
+
+  BUILD RESULT (confirmed after changes):
+      size systest.exe:
+        text    data     bss
+       64960      88     112
+    The 60 KB of .text is the embedded ocsvm_fw_image[] array in .rodata.
+
+================================================================================
+FILE 5: data_collector/collect_esp_monitors.c   (NEW FILE)
+================================================================================
+
+WHAT IT IS
+  A Linux/Ariane userspace program that samples all ESP hardware performance
+  counters and writes the delta values (counter increments per window) as CSV
+  rows.  Its purpose is to collect labelled training data for future OCSVM
+  model retraining.
+
+WHY IT WAS WRITTEN
+  The existing OCSVM model was trained on a static dataset.  To retrain or
+  expand the model to cover new attack scenarios or SoC configurations, we need
+  a way to capture live counter data on hardware and attach ground-truth labels.
+  The reference dataset format is the attached CSV file:
+      bg100ms_3f1_3v_dos_rv2_vfrac5_n1_l0_w50_s300_01.csv
+
+DESIGN CHOICES
+
+  1. Follows background_monitor.c structure exactly
+     - Same include set: <esp.h>, <esp_accelerator.h>, "monitors.h"
+     - Same API: esp_monitor(ESP_MON_READ_ALL), esp_monitor_diff()
+     - Same 100 ms default interval (configurable with -i)
+     - Linux-only (#define LINUX required for the monitors mmap path)
+
+  2. CSV column layout exactly matches the reference CSV (392 columns)
+     The CSV header was extracted from the reference file and counted:
+       · 13 memory-tile columns (DDR, coherence, DMA, L2, LLC)
+       · CSV_NACC × 3 accelerator columns (TLB, mem, total cycles per acc)
+       · CSV_NTILES × 4 DVFS columns (operating-point dwell time per tile)
+       · CSV_NTILES × 6 NoC-inject columns (packets per plane per tile)
+       · CSV_NTILES × 6 × 5 NoC-backpressure columns (queue-full per tile/plane/queue)
+       · 1 Time column (elapsed microseconds for the sampling window)
+       · 1 optional Label column (appended when -a flag is used)
+     Total = 13 + 6×3 + 9×4 + 9×6 + 9×6×5 + 1 = 391 + optional 1 = 392.
+
+  3. CSV_NTILES / CSV_NACC compile-time parameters
+     The reference CSV was collected on a 3×3 SoC (9 tiles, 6 accs).  The
+     VC707 prototype is a 2×2 SoC (4 tiles, 1 acc).  To produce output
+     compatible with the reference training set, we zero-pad columns for
+     tiles/accs beyond SOC_NTILES / SOC_NACC and emit all 392 columns
+     regardless of the actual SoC size.  This allows the same sklearn OCSVM
+     model to be applied without retraining when running on the smaller SoC.
+
+  4. Tile index derivation from soc_locs.h
+     The CPU tile index (needed for L2 hit/miss counters) and mem tile index
+     are derived at runtime by including soc_locs.h inside init_tile_indices()
+     — the same technique used by libmonitors.c::esp_monitor().  This avoids
+     hard-coding tile numbers that could be wrong if the SoC is regenerated.
+
+  SOURCE:
+    - Reference CSV header: extracted from the attached CSV file
+      bg100ms_3f1_3v_dos_rv2_vfrac5_n1_l0_w50_s300_01.csv (392 columns, rows
+      confirmed with `awk -F',' '{print NF}' ...`).
+    - Column order and names: read directly from the CSV row 1 header.
+    - Monitor API: esp-heep/soft/common/drivers/common/include/monitors.h
+      (esp_monitor_vals_t struct field names, SOC_* constants).
+    - libmonitors.c for read semantics and the soc_locs.h include pattern.
+    - background_monitor/background_monitor.c for feature extraction patterns
+      and the overall program structure (sampling + spinloop + delta + output).
+
+CLI INTERFACE
+  collect_esp_monitors.exe [OPTIONS]
+    -o <file>   output CSV file (required)
+    -n <N>      number of samples (0 = run until SIGINT, default)
+    -i <ms>     sampling interval in milliseconds (default 100)
+    -a <label>  label string appended as last column (e.g. normal, dos)
+    -H          suppress CSV header row
+    -f          flush after every row (default: flush every 10 rows)
+
+================================================================================
+FILE 6: data_collector/Makefile   (NEW FILE)
+================================================================================
+
+WHAT IT IS
+  Build system for collect_esp_monitors.exe.
+
+KEY VARIABLES
+  CROSS_COMPILE  riscv64-unknown-linux-gnu-
+  ESP_ROOT       ../../esp-heep
+  DESIGN_PATH    $(ESP_ROOT)/socs/xilinx-vc707-xc7vx485t
+  CSV_NTILES     9  (matches reference CSV format)
+  CSV_NACC       6
+
+TARGETS
+  make            — build collect_esp_monitors.exe (calls esp-libs first)
+  make esp-libs   — build libmonitors.a from ESP sources if not present
+  make clean      — remove .o and .exe
+  make clobber    — also remove esp-build/
+
+INCLUDE PATHS
+  $(ESP_ROOT)/soft/common/drivers/common/include  — monitors.h, soc_defs.h
+  $(ESP_ROOT)/soft/common/drivers/linux/include   — esp.h, esp_accelerator.h
+  $(DESIGN_PATH)/socgen/esp                       — soc_defs.h, soc_locs.h
+
+LINK ORDER NOTE
+  The object file must appear before -lmonitors on the linker line.  GNU ld
+  resolves archive symbols left-to-right; placing -lmonitors before the .o
+  results in "undefined reference to esp_monitor" errors.
+
+BUILD RESULT (confirmed):
+  collect_esp_monitors.exe: ELF 64-bit LSB executable, UCB RISC-V
+  text=14898  data=824  bss=56
+
+================================================================================
+SUMMARY TABLE
+================================================================================
+
+  File                                                 | Status  | Phase
+  -----------------------------------------------------|---------|-------
+  ocsvm_baremetal/link.ld                              | MODIFIED| 3
+  ocsvm_baremetal/Makefile                             | MODIFIED| 3
+  esp-heep/socs/xilinx-vc707-xc7vx485t/systest.c      | MODIFIED| 1,2,3
+  esp-heep/socs/xilinx-vc707-xc7vx485t/ocsvm_fw_image.h| NEW    | 3
+  data_collector/collect_esp_monitors.c                | NEW     | 4
+  data_collector/Makefile                              | NEW     | 4
+
+FILES READ BUT NOT MODIFIED (used as reference/source of truth)
+  esp-heep/socs/xilinx-vc707-xc7vx485t/socgen/esp/soc_defs.h
+  esp-heep/socs/xilinx-vc707-xc7vx485t/socgen/esp/soc_locs.h
+  esp-heep/soft/common/drivers/common/include/monitors.h
+  esp-heep/soft/common/drivers/common/monitors/libmonitors.c
+  esp-heep/accelerators/third-party/xheep/xheep_wrapper.v
+  esp-heep/accelerators/third-party/xheep/ip/x-heep/configs/esp_heep.hjson
+  background_monitor/background_monitor.c
+  bg100ms_3f1_3v_dos_rv2_vfrac5_n1_l0_w50_s300_01.csv  (attached)
+
+================================================================================
+HOW TO BUILD
+================================================================================
+
+  # RV32 Ibex firmware
+  cd ocsvm_baremetal/
+  make RISCV32=/home/amc2535/tools/riscv
+  # -> ocsvm_baremetal.bin
+
+  # Regenerate the embedded header from the binary
+  xxd -i ocsvm_baremetal.bin \
+      | sed 's/unsigned char ocsvm_baremetal_bin/static const uint8_t ocsvm_fw_image/' \
+      | sed 's/unsigned int ocsvm_baremetal_bin_len/static const uint32_t ocsvm_fw_image_len/' \
+      > ocsvm_fw_image.h
+  cp ocsvm_fw_image.h ../esp-heep/socs/xilinx-vc707-xc7vx485t/
+
+  # Ariane bare-metal launcher (embeds the firmware)
+  cd ../esp-heep/socs/xilinx-vc707-xc7vx485t/
+  make soft
+  # -> systest.exe / systest.bin
+
+  # Linux data collector (cross-compiled for Ariane)
+  cd ../../../data_collector/
+  make
+  # -> collect_esp_monitors.exe
+
+================================================================================
+HOW TO TEST
+================================================================================
+
+  Simulation (bare-metal launcher + Ibex firmware, no Linux required):
+    cd esp-heep/socs/xilinx-vc707-xc7vx485t/
+    make soft && make sim
+    Expected output:
+      [systest] PLIC src=6 enabled, waiting for SoCurity IRQ...
+      [xheep] DMA fetch started (...words -> Ibex SRAM 0x00000000)
+      [xheep] DMA fetch done
+      [xheep] Ibex released
+
+  Data collection (requires Linux on hardware + programmed FPGA):
+    # Copy to board
+    scp data_collector/collect_esp_monitors.exe root@$SSH_IP:/root/
+
+    # Normal traffic
+    ssh root@$SSH_IP ./collect_esp_monitors.exe -o normal.csv -n 300
+
+    # Under attack scenario
+    ssh root@$SSH_IP ./collect_esp_monitors.exe -o attack.csv -n 300 -a dos
+
+================================================================================
+END OF DOCUMENT
+================================================================================
